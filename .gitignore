@@ -13,3 +13,4 @@ build/
 .ipynb_checkpoints/
 output_bev_results/
 artifacts/
+data/nuscenes/

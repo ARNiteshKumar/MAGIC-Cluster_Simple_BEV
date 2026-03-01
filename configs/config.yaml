@@ -60,6 +60,13 @@ evaluation:
   iou_threshold: 0.5
   num_synthetic_samples: 64
 
+data:
+  # Set source to "nuscenes" to use real nuScenes mini, or "synthetic" for random data
+  source: nuscenes
+  nuscenes_dataroot: data/nuscenes
+  nuscenes_version: v1.0-mini
+  max_samples: null  # null = use all available samples
+
 paths:
   data_dir: src/data/
   checkpoint_dir: artifacts/
