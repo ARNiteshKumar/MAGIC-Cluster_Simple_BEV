@@ -23,7 +23,13 @@ if [ "$SKIP_TRAIN" = false ]; then
     echo -e "${YELLOW}[STEP 2/5] Training Model${NC}"
     bash scripts/train.sh configs/config.yaml "$DATA"
 else
-    echo -e "${YELLOW}[STEP 2/5] Skipping training${NC}"
+    echo -e "${YELLOW}[STEP 2/5] Skipping training (using existing weights)${NC}"
+    if [ ! -f "artifacts/simple_bev.pt" ]; then
+        echo -e "${RED}ERROR: --skip-train requires artifacts/simple_bev.pt to exist.${NC}"
+        echo -e "${RED}Either run training first, or download weights from GitHub Releases.${NC}"
+        exit 1
+    fi
+    echo -e "  Found weights: artifacts/simple_bev.pt"
 fi
 
 echo -e "${YELLOW}[STEP 3/5] Exporting to ONNX & Validation${NC}"

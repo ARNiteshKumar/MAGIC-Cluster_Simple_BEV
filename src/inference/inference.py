@@ -372,14 +372,15 @@ def pytorch_inference(imgs_np: np.ndarray, cfg: dict):
     model = build_model(cfg).to(device)
     model.eval()
 
-    # load checkpoint if available
+    # load checkpoint
     ckpt_path = cfg["inference"].get("pytorch_model_path", "artifacts/simple_bev.pt")
-    if os.path.exists(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device, weights_only=True)
-        model.load_state_dict(state)
-        print(f"  Loaded PyTorch checkpoint: {ckpt_path}")
-    else:
-        print(f"  No checkpoint found at {ckpt_path}, using random weights")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"PyTorch weights not found at {ckpt_path}. "
+            f"Run training first: bash scripts/train.sh")
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    print(f"  Loaded PyTorch checkpoint: {ckpt_path}")
 
     imgs_t = torch.from_numpy(imgs_np).to(device)
     all_logits = []

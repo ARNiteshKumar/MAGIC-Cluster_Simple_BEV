@@ -23,12 +23,17 @@ pt_weights_path = sys.argv[3]
 
 # ── Load PyTorch model with trained weights ──
 model = SimpleBEVModel().eval()
-if os.path.exists(pt_weights_path):
-    state = torch.load(pt_weights_path, map_location='cpu', weights_only=True)
-    model.load_state_dict(state)
-    print(f"  Loaded PyTorch weights: {pt_weights_path}")
-else:
-    print(f"  WARNING: No weights at {pt_weights_path}, using random init")
+if not os.path.exists(pt_weights_path):
+    print(f"  ERROR: No weights found at {pt_weights_path}")
+    print(f"  Run training first:  bash scripts/train.sh")
+    sys.exit(1)
+if not os.path.exists(onnx_model_path):
+    print(f"  ERROR: No ONNX model found at {onnx_model_path}")
+    print(f"  Run export first:  bash scripts/export.sh")
+    sys.exit(1)
+state = torch.load(pt_weights_path, map_location='cpu', weights_only=True)
+model.load_state_dict(state)
+print(f"  Loaded PyTorch weights: {pt_weights_path}")
 
 dummy = torch.randn(1, 6, 3, 224, 400)
 dummy_np = dummy.numpy()

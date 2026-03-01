@@ -25,12 +25,13 @@ os.makedirs('artifacts', exist_ok=True)
 # ──────────────────────────────────────────────────────────────────────
 print("\n[1/6] Loading PyTorch model ...")
 model = SimpleBEVModel()
-if os.path.exists(weights_path):
-    state = torch.load(weights_path, map_location='cpu', weights_only=True)
-    model.load_state_dict(state)
-    print(f"  Loaded weights from: {weights_path}")
-else:
-    print(f"  WARNING: No weights at {weights_path}, using random init")
+if not os.path.exists(weights_path):
+    print(f"  ERROR: No weights found at {weights_path}")
+    print(f"  Run training first:  bash scripts/train.sh")
+    sys.exit(1)
+state = torch.load(weights_path, map_location='cpu', weights_only=True)
+model.load_state_dict(state)
+print(f"  Loaded weights from: {weights_path}")
 model.eval()
 
 # ──────────────────────────────────────────────────────────────────────
