@@ -5,8 +5,9 @@ Runs both PyTorch and ONNX inference on nuScenes-style data.
 Outputs:
   - BEV segmentation maps with bounding boxes per class
   - Per-class and mean IoU (Intersection over Union)
+  - mAP (mean Average Precision) baseline evaluation
   - Per-class and overall accuracy
-  - MSC verification (PyTorch vs ONNX numerical comparison)
+  - MSE verification (PyTorch vs ONNX numerical comparison, threshold 1e-6)
   - Latency benchmarks for both backends
   - Saved bbox images into output folder
 
@@ -219,21 +220,110 @@ def compute_accuracy(pred: np.ndarray, gt: np.ndarray, num_classes: int):
     return overall_acc, per_class_acc
 
 
-# ===================== MSC VERIFICATION ====================================
+# ===================== mAP EVALUATION ======================================
 
-def msc_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
+def compute_ap_per_class(pred_logits: np.ndarray, gt: np.ndarray,
+                         num_classes: int, num_thresholds: int = 11):
     """
-    Model Similarity Check (MSC) between PyTorch and ONNX outputs.
+    Compute per-class Average Precision (AP) for BEV segmentation.
 
-    Compares raw logits (before argmax) to verify numerical consistency.
+    Uses the softmax confidence of the predicted class as a score and sweeps
+    over multiple IoU thresholds (following PASCAL VOC-style AP).
+
+    Args:
+        pred_logits: (N, C, H, W) raw logits from model
+        gt: (N, H, W) ground-truth class indices
+        num_classes: total number of classes
+        num_thresholds: number of confidence thresholds for P-R curve
 
     Returns:
-        dict with max_diff, mean_diff, cosine_similarity,
+        ap_per_class: dict {class_name: AP}
+        mean_ap: float (mAP across non-background classes)
+    """
+    from scipy.special import softmax as scipy_softmax
+
+    # Convert logits to per-class probabilities: (N, C, H, W)
+    probs = scipy_softmax(pred_logits, axis=1)
+    # Predicted class: (N, H, W)
+    preds = pred_logits.argmax(axis=1)
+
+    thresholds = np.linspace(0.0, 1.0, num_thresholds)
+    ap_per_class = {}
+    aps = []
+
+    for cls in range(num_classes):
+        cls_name = CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else f"class_{cls}"
+
+        # Binary masks for this class
+        gt_mask = (gt == cls)              # (N, H, W)
+        pred_mask = (preds == cls)         # (N, H, W)
+        cls_conf = probs[:, cls, :, :]     # (N, H, W)  confidence for this class
+
+        total_gt = gt_mask.sum()
+        if total_gt == 0:
+            ap_per_class[cls_name] = float("nan")
+            continue
+
+        precisions = []
+        recalls = []
+
+        for thr in thresholds:
+            # Threshold the confidence to decide positive predictions
+            thresholded = pred_mask & (cls_conf >= thr)
+
+            tp = float(np.logical_and(thresholded, gt_mask).sum())
+            fp = float(np.logical_and(thresholded, ~gt_mask).sum())
+            fn = float(np.logical_and(~thresholded, gt_mask).sum())
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+            precisions.append(precision)
+            recalls.append(recall)
+
+        # Compute AP as area under the Precision-Recall curve (trapezoidal)
+        # Sort by recall for proper AUC computation
+        sorted_pairs = sorted(zip(recalls, precisions))
+        sorted_recalls = [r for r, _ in sorted_pairs]
+        sorted_precisions = [p for _, p in sorted_pairs]
+
+        # Monotonically decreasing precision (envelope)
+        for i in range(len(sorted_precisions) - 2, -1, -1):
+            sorted_precisions[i] = max(sorted_precisions[i],
+                                       sorted_precisions[i + 1])
+
+        ap = 0.0
+        for i in range(1, len(sorted_recalls)):
+            ap += (sorted_recalls[i] - sorted_recalls[i - 1]) * sorted_precisions[i]
+
+        ap_per_class[cls_name] = ap
+        if cls > 0:  # exclude background from mAP
+            aps.append(ap)
+
+    mean_ap = float(np.nanmean(aps)) if aps else 0.0
+    return ap_per_class, mean_ap
+
+
+# ===================== MSE VERIFICATION ====================================
+
+MSE_THRESHOLD = 1e-6
+
+
+def mse_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
+    """
+    MSE verification between PyTorch and ONNX outputs.
+
+    Compares raw logits (before argmax) to verify numerical consistency.
+    Uses MSE (Mean Squared Error) with threshold 1e-6 as the primary metric.
+
+    Returns:
+        dict with mse, max_diff, mean_diff, cosine_similarity,
              pred_agreement (%), status
     """
-    diff = np.abs(pytorch_output - onnx_output)
-    max_diff = float(diff.max())
-    mean_diff = float(diff.mean())
+    diff = pytorch_output.astype(np.float64) - onnx_output.astype(np.float64)
+    mse = float(np.mean(diff ** 2))
+    max_diff = float(np.max(np.abs(diff)))
+    mean_diff = float(np.mean(np.abs(diff)))
 
     # cosine similarity (flatten both)
     a = pytorch_output.flatten().astype(np.float64)
@@ -248,9 +338,10 @@ def msc_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
     ox_pred = onnx_output.argmax(axis=1)
     pred_agreement = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
 
-    status = "PASSED" if max_diff < 1e-4 and pred_agreement > 99.0 else "REVIEW"
+    status = "PASSED" if mse < MSE_THRESHOLD and pred_agreement > 99.0 else "REVIEW"
 
     return {
+        "mse": mse,
         "max_diff": max_diff,
         "mean_diff": mean_diff,
         "cosine_similarity": cosine_sim,
@@ -362,7 +453,7 @@ def onnx_inference(imgs_np: np.ndarray, cfg: dict):
 # ===================== REPORT GENERATION ===================================
 
 def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
-                    msc: dict, cfg: dict, output_dir: str):
+                    mse_result: dict, cfg: dict, output_dir: str):
     """Write a comprehensive evaluation report to a text file."""
     num_classes = cfg["model"]["num_classes"]
     lines = []
@@ -379,48 +470,40 @@ def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
         lines.append(f"  {i}: {name:<20s}  RGB({c[0]:3d},{c[1]:3d},{c[2]:3d})")
     lines.append("")
 
-    # ----- PyTorch Metrics -----
-    lines.append("PYTORCH EVALUATION METRICS")
-    lines.append("-" * 40)
-    lines.append(f"  Mean latency      : {pytorch_metrics['latency_ms']:.2f} ms/sample")
-    lines.append(f"  Overall accuracy  : {pytorch_metrics['overall_accuracy'] * 100:.2f}%")
-    lines.append(f"  Mean IoU (mIoU)   : {pytorch_metrics['mean_iou'] * 100:.2f}%")
-    lines.append("  Per-class IoU:")
-    for name, val in pytorch_metrics["iou_per_class"].items():
-        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
-        lines.append(f"    {name:<20s}: {v}")
-    lines.append("  Per-class accuracy:")
-    for name, val in pytorch_metrics["per_class_accuracy"].items():
-        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
-        lines.append(f"    {name:<20s}: {v}")
-    lines.append(f"  Total bboxes detected: {pytorch_metrics['total_bboxes']}")
-    lines.append("")
+    def _report_backend(label, metrics):
+        lines.append(f"{label} EVALUATION METRICS")
+        lines.append("-" * 40)
+        lines.append(f"  Mean latency      : {metrics['latency_ms']:.2f} ms/sample")
+        lines.append(f"  Overall accuracy  : {metrics['overall_accuracy'] * 100:.2f}%")
+        lines.append(f"  Mean IoU (mIoU)   : {metrics['mean_iou'] * 100:.2f}%")
+        lines.append(f"  Mean AP  (mAP)    : {metrics['mean_ap'] * 100:.2f}%")
+        lines.append("  Per-class IoU:")
+        for name, val in metrics["iou_per_class"].items():
+            v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
+            lines.append(f"    {name:<20s}: {v}")
+        lines.append("  Per-class AP:")
+        for name, val in metrics["ap_per_class"].items():
+            v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
+            lines.append(f"    {name:<20s}: {v}")
+        lines.append("  Per-class accuracy:")
+        for name, val in metrics["per_class_accuracy"].items():
+            v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
+            lines.append(f"    {name:<20s}: {v}")
+        lines.append(f"  Total bboxes detected: {metrics['total_bboxes']}")
+        lines.append("")
 
-    # ----- ONNX Metrics -----
-    lines.append("ONNX EVALUATION METRICS")
-    lines.append("-" * 40)
-    lines.append(f"  Mean latency      : {onnx_metrics['latency_ms']:.2f} ms/sample")
-    lines.append(f"  Overall accuracy  : {onnx_metrics['overall_accuracy'] * 100:.2f}%")
-    lines.append(f"  Mean IoU (mIoU)   : {onnx_metrics['mean_iou'] * 100:.2f}%")
-    lines.append("  Per-class IoU:")
-    for name, val in onnx_metrics["iou_per_class"].items():
-        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
-        lines.append(f"    {name:<20s}: {v}")
-    lines.append("  Per-class accuracy:")
-    for name, val in onnx_metrics["per_class_accuracy"].items():
-        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
-        lines.append(f"    {name:<20s}: {v}")
-    lines.append(f"  Total bboxes detected: {onnx_metrics['total_bboxes']}")
-    lines.append("")
+    _report_backend("PYTORCH", pytorch_metrics)
+    _report_backend("ONNX", onnx_metrics)
 
-    # ----- MSC Verification -----
-    lines.append("MSC VERIFICATION (PyTorch vs ONNX)")
+    # ----- MSE Verification (PyTorch vs ONNX) -----
+    lines.append("MSE VERIFICATION (PyTorch vs ONNX)")
     lines.append("-" * 40)
-    lines.append(f"  Max absolute diff      : {msc['max_diff']:.2e}")
-    lines.append(f"  Mean absolute diff     : {msc['mean_diff']:.2e}")
-    lines.append(f"  Cosine similarity      : {msc['cosine_similarity']:.8f}")
-    lines.append(f"  Prediction agreement   : {msc['prediction_agreement_pct']:.2f}%")
-    lines.append(f"  Status                 : {msc['status']}")
+    lines.append(f"  MSE (threshold 1e-6)   : {mse_result['mse']:.2e}")
+    lines.append(f"  Max absolute diff      : {mse_result['max_diff']:.2e}")
+    lines.append(f"  Mean absolute diff     : {mse_result['mean_diff']:.2e}")
+    lines.append(f"  Cosine similarity      : {mse_result['cosine_similarity']:.8f}")
+    lines.append(f"  Prediction agreement   : {mse_result['prediction_agreement_pct']:.2f}%")
+    lines.append(f"  Status                 : {mse_result['status']}")
     lines.append("")
 
     # ----- Latency Comparison -----
@@ -503,22 +586,25 @@ def main():
     # ---- 4. Compute metrics ----
     print("\n[4/5] Computing evaluation metrics ...")
 
-    # MSC verification
-    msc = msc_verification(pt_logits, ox_logits)
-    print(f"  MSC status             : {msc['status']}")
-    print(f"  Max diff               : {msc['max_diff']:.2e}")
-    print(f"  Prediction agreement   : {msc['prediction_agreement_pct']:.2f}%")
+    # MSE verification (PyTorch vs ONNX, threshold 1e-6)
+    mse_result = mse_verification(pt_logits, ox_logits)
+    print(f"  MSE status             : {mse_result['status']}")
+    print(f"  MSE                    : {mse_result['mse']:.2e}")
+    print(f"  Max diff               : {mse_result['max_diff']:.2e}")
+    print(f"  Prediction agreement   : {mse_result['prediction_agreement_pct']:.2f}%")
 
     # PyTorch metrics vs ground truth
     pt_iou_per_class, pt_miou = compute_iou_per_class(pt_preds, gt_labels, num_classes)
     pt_overall_acc, pt_class_acc = compute_accuracy(pt_preds, gt_labels, num_classes)
+    pt_ap_per_class, pt_map = compute_ap_per_class(pt_logits, gt_labels, num_classes)
 
     # ONNX metrics vs ground truth
     ox_iou_per_class, ox_miou = compute_iou_per_class(ox_preds, gt_labels, num_classes)
     ox_overall_acc, ox_class_acc = compute_accuracy(ox_preds, gt_labels, num_classes)
+    ox_ap_per_class, ox_map = compute_ap_per_class(ox_logits, gt_labels, num_classes)
 
-    print(f"\n  PyTorch  =>  mIoU: {pt_miou*100:.2f}%  Accuracy: {pt_overall_acc*100:.2f}%")
-    print(f"  ONNX RT  =>  mIoU: {ox_miou*100:.2f}%  Accuracy: {ox_overall_acc*100:.2f}%")
+    print(f"\n  PyTorch  =>  mIoU: {pt_miou*100:.2f}%  mAP: {pt_map*100:.2f}%  Accuracy: {pt_overall_acc*100:.2f}%")
+    print(f"  ONNX RT  =>  mIoU: {ox_miou*100:.2f}%  mAP: {ox_map*100:.2f}%  Accuracy: {ox_overall_acc*100:.2f}%")
 
     # ---- 5. Extract bboxes and save images ----
     print(f"\n[5/5] Extracting bounding boxes & saving visualisations to {output_dir}/ ...")
@@ -566,6 +652,8 @@ def main():
         "mean_iou": pt_miou,
         "iou_per_class": pt_iou_per_class,
         "per_class_accuracy": pt_class_acc,
+        "mean_ap": pt_map,
+        "ap_per_class": pt_ap_per_class,
         "total_bboxes": pt_total_bboxes,
     }
     onnx_metrics = {
@@ -574,12 +662,14 @@ def main():
         "mean_iou": ox_miou,
         "iou_per_class": ox_iou_per_class,
         "per_class_accuracy": ox_class_acc,
+        "mean_ap": ox_map,
+        "ap_per_class": ox_ap_per_class,
         "total_bboxes": ox_total_bboxes,
     }
 
     # ---- Generate report ----
     report, report_path = generate_report(pytorch_metrics, onnx_metrics,
-                                          msc, cfg, output_dir)
+                                          mse_result, cfg, output_dir)
     print(f"\n{'=' * 60}")
     print(report)
     print(f"\nReport saved to: {report_path}")
