@@ -3,6 +3,7 @@ torchvision>=0.15.0
 onnx>=1.14.0
 onnxruntime>=1.16.0
 onnxsim>=0.4.33
+onnxscript>=0.1.0
 numpy>=1.24.0
 pyyaml>=6.0
 tqdm>=4.65.0
