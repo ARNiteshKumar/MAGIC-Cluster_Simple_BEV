@@ -1,7 +1,7 @@
 """
 Simple-BEV Inference & Evaluation Script
 =========================================
-Runs both PyTorch and ONNX inference on nuScenes-style data.
+Runs both PyTorch and ONNX inference on nuScenes mini or synthetic data.
 Outputs:
   - BEV segmentation maps with bounding boxes per class
   - Per-class and mean IoU (Intersection over Union)
@@ -13,7 +13,8 @@ Outputs:
 
 Usage:
   python src/inference/inference.py --config configs/config.yaml
-  python src/inference/inference.py --config configs/config.yaml --num_samples 16
+  python src/inference/inference.py --config configs/config.yaml --data nuscenes
+  python src/inference/inference.py --config configs/config.yaml --data synthetic --num_samples 16
 """
 import argparse
 import os
@@ -534,8 +535,10 @@ def main():
         description="Simple-BEV Inference with bbox output, IoU metrics & MSC verification")
     parser.add_argument("--config", default="configs/config.yaml",
                         help="Path to config YAML")
+    parser.add_argument("--data", choices=["nuscenes", "synthetic"], default=None,
+                        help="Data source (overrides config)")
     parser.add_argument("--num_samples", type=int, default=None,
-                        help="Number of synthetic samples (overrides config)")
+                        help="Number of samples (overrides config)")
     parser.add_argument("--provider", default=None,
                         help="ONNX Runtime provider (overrides config)")
     parser.add_argument("--output_dir", default=None,
@@ -563,9 +566,17 @@ def main():
     print("  Simple-BEV Inference & Evaluation")
     print("=" * 60)
 
-    # ---- 1. Generate common input ----
-    print(f"\n[1/5] Generating {num_samples} synthetic nuScenes-style samples ...")
-    imgs, gt_labels = get_synthetic_dataset(cfg, n_samples=num_samples)
+    # ---- 1. Load data ----
+    data_source = args.data or cfg.get("data", {}).get("source", "synthetic")
+    if data_source == "nuscenes":
+        print(f"\n[1/5] Loading nuScenes mini dataset ...")
+        from src.data.nuscenes_loader import get_nuscenes_dataset
+        imgs, gt_labels = get_nuscenes_dataset(cfg, max_samples=num_samples)
+        num_samples = imgs.shape[0]
+    else:
+        print(f"\n[1/5] Generating {num_samples} synthetic samples ...")
+        imgs, gt_labels = get_synthetic_dataset(cfg, n_samples=num_samples)
+    print(f"  Data source  : {data_source}")
     print(f"  Input shape  : {imgs.shape}  (N, cams, C, H, W)")
     print(f"  Labels shape : {gt_labels.shape}  (N, bev_H, bev_W)")
 
