@@ -1,0 +1,238 @@
+name: ONNX Export & Validation Pipeline
+
+on:
+  push:
+    branches: [main, claude/**]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  onnx-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify imports
+        run: |
+          python -c "
+          import torch, onnx, onnxruntime, numpy, yaml
+          print(f'torch:       {torch.__version__}')
+          print(f'onnx:        {onnx.__version__}')
+          print(f'onnxruntime: {onnxruntime.__version__}')
+          print(f'numpy:       {numpy.__version__}')
+          print(f'CUDA:        {torch.cuda.is_available()}')
+          "
+
+      - name: Train model (synthetic data, 3 epochs)
+        run: |
+          python -c "
+          import yaml, torch, torch.nn as nn, torch.optim as optim, sys, time
+          from pathlib import Path
+          from torch.utils.data import DataLoader, TensorDataset
+          sys.path.insert(0, '.')
+          from src.models.simple_bev import build_model
+
+          with open('configs/config.yaml') as f:
+              cfg = yaml.safe_load(f)
+
+          # Override for CI: fewer epochs, CPU only
+          cfg['training']['epochs'] = 3
+          cfg['training']['device'] = 'cpu'
+
+          model = build_model(cfg)
+          optimizer = optim.AdamW(model.parameters(), lr=cfg['training']['learning_rate'])
+          criterion = nn.CrossEntropyLoss()
+          inp = cfg['input']; mod = cfg['model']
+          imgs = torch.randn(8, mod['ncams'], inp['channels'], inp['height'], inp['width'])
+          labels = torch.randint(0, mod['num_classes'], (8, mod['bev_h'], mod['bev_w']))
+          loader = DataLoader(TensorDataset(imgs, labels), batch_size=2, shuffle=True)
+
+          for epoch in range(1, cfg['training']['epochs'] + 1):
+              model.train(); total_loss = 0.0
+              for batch_imgs, batch_labels in loader:
+                  optimizer.zero_grad()
+                  loss = criterion(model(batch_imgs), batch_labels)
+                  loss.backward(); optimizer.step()
+                  total_loss += loss.item()
+              print(f'Epoch [{epoch}/{cfg[\"training\"][\"epochs\"]}] Loss: {total_loss/len(loader):.4f}')
+
+          Path('artifacts').mkdir(exist_ok=True)
+          torch.save(model.state_dict(), 'artifacts/simple_bev.pt')
+          print('Model saved to artifacts/simple_bev.pt')
+          "
+
+      - name: Export to ONNX
+        run: |
+          python -c "
+          import torch, onnx, sys
+          sys.path.insert(0, '.')
+          from src.models.simple_bev import SimpleBEVModel
+
+          model = SimpleBEVModel()
+          state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
+          model.load_state_dict(state)
+          model.eval()
+
+          dummy = torch.randn(1, 6, 3, 224, 400)
+          with torch.no_grad():
+              torch.onnx.export(
+                  model, dummy, 'artifacts/simple_bev.onnx',
+                  opset_version=17,
+                  input_names=['multi_camera_imgs'],
+                  output_names=['bev_segmentation'],
+                  dynamic_axes={
+                      'multi_camera_imgs': {0: 'batch'},
+                      'bev_segmentation': {0: 'batch'},
+                  },
+              )
+          print('ONNX exported: artifacts/simple_bev.onnx')
+
+          # Validate graph
+          onnx_model = onnx.load('artifacts/simple_bev.onnx')
+          onnx.checker.check_model(onnx_model)
+          print('ONNX graph validation: PASSED')
+          "
+
+      - name: Simplify ONNX model
+        run: |
+          python -c "
+          import onnx
+          from onnxsim import simplify
+
+          model = onnx.load('artifacts/simple_bev.onnx')
+          simp, ok = simplify(model)
+          if ok:
+              onnx.save(simp, 'artifacts/simple_bev_optimized.onnx')
+              print('Optimized ONNX saved: artifacts/simple_bev_optimized.onnx')
+          else:
+              import shutil
+              shutil.copy('artifacts/simple_bev.onnx', 'artifacts/simple_bev_optimized.onnx')
+              print('Simplification failed, using base export')
+          "
+
+      - name: Numerical validation (PyTorch vs ONNX Runtime)
+        run: |
+          python -c "
+          import torch, onnxruntime as ort, numpy as np, sys
+          sys.path.insert(0, '.')
+          from src.models.simple_bev import SimpleBEVModel
+
+          MSE_THRESHOLD = 1e-6
+
+          # Load PyTorch model
+          model = SimpleBEVModel()
+          state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
+          model.load_state_dict(state)
+          model.eval()
+
+          # Load ONNX model
+          opts = ort.SessionOptions()
+          opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+          sess = ort.InferenceSession('artifacts/simple_bev_optimized.onnx', opts,
+                                      providers=['CPUExecutionProvider'])
+          iname = sess.get_inputs()[0].name
+          oname = sess.get_outputs()[0].name
+
+          print(f'Input:  {iname} shape={sess.get_inputs()[0].shape}')
+          print(f'Output: {oname} shape={sess.get_outputs()[0].shape}')
+
+          # Test with multiple random inputs
+          worst_mse = 0.0
+          for i in range(5):
+              test_input = torch.randn(1, 6, 3, 224, 400)
+              with torch.no_grad():
+                  pt_out = model(test_input).numpy()
+              ort_out = sess.run([oname], {iname: test_input.numpy()})[0]
+
+              diff = pt_out.astype(np.float64) - ort_out.astype(np.float64)
+              mse = float(np.mean(diff ** 2))
+              max_diff = float(np.max(np.abs(diff)))
+              worst_mse = max(worst_mse, mse)
+              print(f'  Sample {i+1}/5: MSE={mse:.2e}  MaxDiff={max_diff:.2e}')
+
+          # Prediction agreement
+          pt_pred = pt_out.argmax(axis=1)
+          ox_pred = ort_out.argmax(axis=1)
+          agreement = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
+
+          print(f'')
+          print(f'Worst MSE:            {worst_mse:.2e}')
+          print(f'Prediction agreement: {agreement:.2f}%')
+          print(f'MSE threshold:        {MSE_THRESHOLD:.0e}')
+
+          if worst_mse < MSE_THRESHOLD:
+              print(f'RESULT: PASSED')
+          else:
+              print(f'RESULT: FAILED')
+              sys.exit(1)
+          "
+
+      - name: Benchmark (PyTorch vs ONNX Runtime)
+        run: |
+          python -c "
+          import torch, onnxruntime as ort, numpy as np, time, sys
+          sys.path.insert(0, '.')
+          from src.models.simple_bev import SimpleBEVModel
+
+          model = SimpleBEVModel()
+          state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
+          model.load_state_dict(state)
+          model.eval()
+          dummy = torch.randn(1, 6, 3, 224, 400)
+
+          # PyTorch benchmark
+          with torch.no_grad():
+              for _ in range(3): model(dummy)
+          pt_lats = []
+          with torch.no_grad():
+              for _ in range(10):
+                  t0 = time.perf_counter()
+                  model(dummy)
+                  pt_lats.append((time.perf_counter() - t0) * 1000)
+
+          # ONNX benchmark
+          opts = ort.SessionOptions()
+          opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+          sess = ort.InferenceSession('artifacts/simple_bev_optimized.onnx', opts,
+                                      providers=['CPUExecutionProvider'])
+          iname = sess.get_inputs()[0].name
+          oname = sess.get_outputs()[0].name
+          dummy_np = dummy.numpy()
+          for _ in range(3): sess.run([oname], {iname: dummy_np})
+          ort_lats = []
+          for _ in range(10):
+              t0 = time.perf_counter()
+              sess.run([oname], {iname: dummy_np})
+              ort_lats.append((time.perf_counter() - t0) * 1000)
+
+          pt_arr = np.array(pt_lats)
+          ort_arr = np.array(ort_lats)
+          print(f'PyTorch CPU:  {pt_arr.mean():.1f} ms (p95: {np.percentile(pt_arr, 95):.1f} ms)')
+          print(f'ONNX Runtime: {ort_arr.mean():.1f} ms (p95: {np.percentile(ort_arr, 95):.1f} ms)')
+          print(f'Speedup:      {pt_arr.mean()/ort_arr.mean():.2f}x')
+          "
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-pipeline-artifacts
+          path: |
+            artifacts/simple_bev.onnx
+            artifacts/simple_bev_optimized.onnx
+          retention-days: 7
