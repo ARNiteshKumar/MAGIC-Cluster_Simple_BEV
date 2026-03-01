@@ -62,7 +62,8 @@ evaluation:
 
 data:
   # Set source to "nuscenes" to use real nuScenes mini, or "synthetic" for random data
-  source: nuscenes
+  # Default is "synthetic" so the pipeline works out of the box without downloading data
+  source: synthetic
   nuscenes_dataroot: data/nuscenes
   nuscenes_version: v1.0-mini
   max_samples: null  # null = use all available samples
