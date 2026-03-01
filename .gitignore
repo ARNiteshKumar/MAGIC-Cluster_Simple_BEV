@@ -3,6 +3,7 @@ __pycache__/
 *.pth
 *.pt
 *.onnx
+*.onnx.data
 .env
 .DS_Store
 logs/
@@ -10,3 +11,5 @@ logs/
 dist/
 build/
 .ipynb_checkpoints/
+output_bev_results/
+artifacts/
