@@ -5,8 +5,8 @@ echo -e "${GREEN}=== Simple-BEV -- Environment Setup ===${NC}"
 echo -e "${YELLOW}Checking Python...${NC}"
 python3 --version
 echo -e "${YELLOW}Installing dependencies...${NC}"
-pip install --upgrade pip --quiet
+pip install --upgrade pip --quiet 2>/dev/null || true
 pip install -r requirements.txt --quiet
 echo -e "${YELLOW}Verifying imports...${NC}"
 python3 -c "import torch, onnx, onnxruntime, numpy; print('torch', torch.__version__); print('onnx', onnx.__version__); print('onnxruntime', onnxruntime.__version__); print('CUDA', torch.cuda.is_available())"
-echo -e "${GREEN}✅ Setup complete!${NC}"
+echo -e "${GREEN}Setup complete!${NC}"
