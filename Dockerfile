@@ -1,4 +1,4 @@
-FROM python3.10-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "src/inference/inference.py", "--model", "artifacts/simple_bev_optimized.onnx"]
+CMD ["bash", "scripts/run_pipeline.sh"]
