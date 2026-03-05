@@ -2,10 +2,15 @@
 """
 End-to-end pipeline validation for Simple-BEV ONNX export.
 
+Model uses 3-input interface matching the reference Segnet:
+  rgb_camXs:    (B, S, 3, H, W)
+  pix_T_cams:   (B, S, 4, 4)
+  cam0_T_camXs: (B, S, 4, 4)
+
 Runs locally to verify:
   1. Model builds correctly from config
   2. Training loop runs (3 epochs on synthetic data)
-  3. ONNX export succeeds (opset 17)
+  3. ONNX export succeeds (opset 17, 3 inputs)
   4. ONNX graph passes checker validation
   5. ONNX simplifier produces optimized model
   6. ONNX Runtime loads and runs inference
@@ -35,6 +40,22 @@ def section(title: str) -> None:
     print(f"{'='*60}")
 
 
+def _make_pinhole_intrinsics(B, S, H, W):
+    """(B, S, 4, 4) pinhole intrinsics: fx=fy=W, cx=W/2, cy=H/2."""
+    import torch
+    K = torch.zeros(4, 4)
+    K[0, 0] = float(W); K[1, 1] = float(W)
+    K[0, 2] = W / 2.0;  K[1, 2] = H / 2.0
+    K[2, 2] = 1.0;      K[3, 3] = 1.0
+    return K.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
+
+def _make_identity_extrinsics(B, S):
+    """(B, S, 4, 4) identity extrinsic matrices."""
+    import torch
+    return torch.eye(4).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Validate Simple-BEV ONNX pipeline")
     parser.add_argument("--skip-train", action="store_true", help="Skip training, use existing weights")
@@ -48,10 +69,14 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    H = cfg["input"]["height"]    # 224
+    W = cfg["input"]["width"]     # 400
+    S = cfg["model"]["ncams"]     # 6
+
     results = {}
     t_start = time.time()
-    weights_path = "artifacts/simple_bev.pt"
-    onnx_path = "artifacts/simple_bev.onnx"
+    weights_path  = "artifacts/simple_bev.pt"
+    onnx_path     = "artifacts/simple_bev.onnx"
     onnx_opt_path = "artifacts/simple_bev_optimized.onnx"
 
     # ── Step 1: Verify imports ──────────────────────────────────────
@@ -74,14 +99,18 @@ def main():
     model = build_model(cfg)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Parameters:  {total_params:,}")
-    print(f"  Input shape: [B, {cfg['model']['ncams']}, {cfg['input']['channels']}, {cfg['input']['height']}, {cfg['input']['width']}]")
-    print(f"  Output shape: [B, {cfg['model']['num_classes']}, {cfg['model']['bev_h']}, {cfg['model']['bev_w']}]")
+    print(f"  Input 1 (rgb_camXs):    [B, {S}, 3, {H}, {W}]")
+    print(f"  Input 2 (pix_T_cams):   [B, {S}, 4, 4]")
+    print(f"  Input 3 (cam0_T_camXs): [B, {S}, 4, 4]")
+    print(f"  Output (bev_seg):        [B, {cfg['model']['num_classes']}, "
+          f"{cfg['model']['bev_h']}, {cfg['model']['bev_w']}]")
 
-    # Quick forward pass sanity check
-    dummy = torch.randn(1, cfg["model"]["ncams"], cfg["input"]["channels"],
-                        cfg["input"]["height"], cfg["input"]["width"])
+    # Quick forward pass sanity check with all 3 inputs
+    dummy_imgs  = torch.randn(1, S, 3, H, W)
+    dummy_pix   = _make_pinhole_intrinsics(1, S, H, W)
+    dummy_cam0  = _make_identity_extrinsics(1, S)
     with torch.no_grad():
-        out = model(dummy)
+        out = model(dummy_imgs, dummy_pix, dummy_cam0)
     expected_shape = (1, cfg["model"]["num_classes"], cfg["model"]["bev_h"], cfg["model"]["bev_w"])
     assert out.shape == expected_shape, f"Expected {expected_shape}, got {out.shape}"
     print(f"  Forward pass: OK (output {list(out.shape)})")
@@ -102,17 +131,22 @@ def main():
         cfg["training"]["epochs"] = args.epochs
         optimizer = optim.AdamW(model.parameters(), lr=cfg["training"]["learning_rate"])
         criterion = nn.CrossEntropyLoss()
-        inp = cfg["input"]; mod = cfg["model"]
-        imgs = torch.randn(8, mod["ncams"], inp["channels"], inp["height"], inp["width"])
-        labels = torch.randint(0, mod["num_classes"], (8, mod["bev_h"], mod["bev_w"]))
-        loader = DataLoader(TensorDataset(imgs, labels), batch_size=2, shuffle=True)
+
+        n = 8
+        imgs_syn   = torch.randn(n, S, 3, H, W)
+        pix_syn    = _make_pinhole_intrinsics(n, S, H, W)
+        cam0_syn   = _make_identity_extrinsics(n, S)
+        labels_syn = torch.randint(0, cfg["model"]["num_classes"],
+                                   (n, cfg["model"]["bev_h"], cfg["model"]["bev_w"]))
+        loader = DataLoader(TensorDataset(imgs_syn, pix_syn, cam0_syn, labels_syn),
+                            batch_size=2, shuffle=True)
 
         for epoch in range(1, args.epochs + 1):
             model.train()
             total_loss = 0.0
-            for batch_imgs, batch_labels in loader:
+            for batch_imgs, batch_pix, batch_cam0, batch_labels in loader:
                 optimizer.zero_grad()
-                loss = criterion(model(batch_imgs), batch_labels)
+                loss = criterion(model(batch_imgs, batch_pix, batch_cam0), batch_labels)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -126,16 +160,23 @@ def main():
     model.eval()
 
     # ── Step 4: ONNX export ─────────────────────────────────────────
-    section("Step 4/7: ONNX export")
-    dummy = torch.randn(1, 6, 3, 224, 400)
+    section("Step 4/7: ONNX export  (3 inputs)")
+    dummy_imgs = torch.randn(1, S, 3, H, W)
+    dummy_pix  = _make_pinhole_intrinsics(1, S, H, W)
+    dummy_cam0 = _make_identity_extrinsics(1, S)
+
     with torch.no_grad():
         torch.onnx.export(
-            model, dummy, onnx_path,
+            model,
+            (dummy_imgs, dummy_pix, dummy_cam0),
+            onnx_path,
             opset_version=17,
-            input_names=["multi_camera_imgs"],
+            input_names=["rgb_camXs", "pix_T_cams", "cam0_T_camXs"],
             output_names=["bev_segmentation"],
             dynamic_axes={
-                "multi_camera_imgs": {0: "batch"},
+                "rgb_camXs":        {0: "batch"},
+                "pix_T_cams":       {0: "batch"},
+                "cam0_T_camXs":     {0: "batch"},
                 "bev_segmentation": {0: "batch"},
             },
         )
@@ -145,7 +186,11 @@ def main():
     # Validate graph
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+    n_inputs = len(onnx_model.graph.input)
+    in_names = [i.name for i in onnx_model.graph.input]
     print(f"  Graph validation: PASSED")
+    print(f"  ONNX inputs ({n_inputs}): {in_names}")
+    assert n_inputs == 3, f"Expected 3 ONNX inputs, got {n_inputs}"
     results["onnx_export"] = "PASSED"
 
     # ── Step 5: ONNX simplification ─────────────────────────────────
@@ -167,30 +212,41 @@ def main():
 
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session = ort.InferenceSession(final_onnx, sess_opts,
-                                   providers=["CPUExecutionProvider"])
-    iname = session.get_inputs()[0].name
+    session  = ort.InferenceSession(final_onnx, sess_opts,
+                                    providers=["CPUExecutionProvider"])
+    ort_in_names = [i.name for i in session.get_inputs()]
     oname = session.get_outputs()[0].name
-    print(f"  Input:    {iname} shape={session.get_inputs()[0].shape}")
-    print(f"  Output:   {oname} shape={session.get_outputs()[0].shape}")
+    print(f"  ONNX inputs ({len(ort_in_names)}): {ort_in_names}")
+    for inp in session.get_inputs():
+        print(f"    {inp.name}: shape={inp.shape}")
+    print(f"  Output: {oname} shape={session.get_outputs()[0].shape}")
     print(f"  Provider: {session.get_providers()}")
 
     worst_mse = 0.0
     for i in range(5):
-        test_in = torch.randn(1, 6, 3, 224, 400)
-        with torch.no_grad():
-            pt_out = model(test_in).numpy()
-        ort_out = session.run([oname], {iname: test_in.numpy()})[0]
+        test_imgs  = torch.randn(1, S, 3, H, W)
+        test_pix   = _make_pinhole_intrinsics(1, S, H, W)
+        test_cam0  = _make_identity_extrinsics(1, S)
 
-        diff = pt_out.astype(np.float64) - ort_out.astype(np.float64)
-        mse = float(np.mean(diff ** 2))
-        max_diff = float(np.max(np.abs(diff)))
+        with torch.no_grad():
+            pt_out = model(test_imgs, test_pix, test_cam0).numpy()
+
+        feed = {
+            ort_in_names[0]: test_imgs.numpy(),
+            ort_in_names[1]: test_pix.numpy(),
+            ort_in_names[2]: test_cam0.numpy(),
+        }
+        ort_out = session.run([oname], feed)[0]
+
+        diff      = pt_out.astype(np.float64) - ort_out.astype(np.float64)
+        mse       = float(np.mean(diff ** 2))
+        max_diff  = float(np.max(np.abs(diff)))
         worst_mse = max(worst_mse, mse)
         print(f"  Sample {i+1}/5: MSE={mse:.2e}  MaxDiff={max_diff:.2e}")
 
     # Prediction agreement on last sample
-    pt_pred = pt_out.argmax(axis=1)
-    ox_pred = ort_out.argmax(axis=1)
+    pt_pred   = pt_out.argmax(axis=1)
+    ox_pred   = ort_out.argmax(axis=1)
     agreement = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
 
     # Cosine similarity on last sample
@@ -212,30 +268,36 @@ def main():
 
     # ── Step 7: Benchmark ───────────────────────────────────────────
     section("Step 7/7: Latency benchmark")
-    dummy = torch.randn(1, 6, 3, 224, 400)
-    dummy_np = dummy.numpy()
+    bench_imgs  = torch.randn(1, S, 3, H, W)
+    bench_pix   = _make_pinhole_intrinsics(1, S, H, W)
+    bench_cam0  = _make_identity_extrinsics(1, S)
+    bench_np    = {
+        ort_in_names[0]: bench_imgs.numpy(),
+        ort_in_names[1]: bench_pix.numpy(),
+        ort_in_names[2]: bench_cam0.numpy(),
+    }
 
     # PyTorch warmup + benchmark
     with torch.no_grad():
         for _ in range(3):
-            model(dummy)
+            model(bench_imgs, bench_pix, bench_cam0)
     pt_lats = []
     with torch.no_grad():
         for _ in range(10):
             t0 = time.perf_counter()
-            model(dummy)
+            model(bench_imgs, bench_pix, bench_cam0)
             pt_lats.append((time.perf_counter() - t0) * 1000)
 
     # ONNX warmup + benchmark
     for _ in range(3):
-        session.run([oname], {iname: dummy_np})
+        session.run([oname], bench_np)
     ort_lats = []
     for _ in range(10):
         t0 = time.perf_counter()
-        session.run([oname], {iname: dummy_np})
+        session.run([oname], bench_np)
         ort_lats.append((time.perf_counter() - t0) * 1000)
 
-    pt_arr = np.array(pt_lats)
+    pt_arr  = np.array(pt_lats)
     ort_arr = np.array(ort_lats)
     speedup = pt_arr.mean() / ort_arr.mean()
 

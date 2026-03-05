@@ -2,6 +2,12 @@
 Simple-BEV Inference & Evaluation Script
 =========================================
 Runs both PyTorch and ONNX inference on nuScenes mini or synthetic data.
+
+Model inputs (3 tensors — matches reference Segnet ONNX interface):
+  rgb_camXs:    (B, S, 3, H, W)
+  pix_T_cams:   (B, S, 4, 4)
+  cam0_T_camXs: (B, S, 4, 4)
+
 Outputs:
   - BEV segmentation maps with bounding boxes per class
   - Per-class and mean IoU (Intersection over Union)
@@ -71,17 +77,65 @@ def _load_class_info(cfg: dict):
             CLASS_COLORS = np.array(cfg["classes"]["colors"], dtype=np.uint8)
 
 
+# ========================= CAMERA MATRIX HELPERS ===========================
+
+def make_pinhole_intrinsics(B: int, S: int, H: int, W: int) -> np.ndarray:
+    """
+    Build a batch of pinhole camera intrinsic matrices (4x4 homogeneous).
+
+    Uses fx = fy = W, cx = W/2, cy = H/2 — reasonable defaults for
+    synthetic data when real calibration is unavailable.
+
+    Returns:
+        pix_T_cams: (B, S, 4, 4) float32
+    """
+    K = np.zeros((4, 4), dtype=np.float32)
+    K[0, 0] = float(W)      # fx
+    K[1, 1] = float(W)      # fy
+    K[0, 2] = W / 2.0       # cx
+    K[1, 2] = H / 2.0       # cy
+    K[2, 2] = 1.0
+    K[3, 3] = 1.0
+    # Broadcast to (B, S, 4, 4)
+    return np.tile(K[None, None], (B, S, 1, 1))
+
+
+def make_identity_extrinsics(B: int, S: int) -> np.ndarray:
+    """
+    Build identity extrinsic matrices: cam0_T_camXs = I for all cameras.
+
+    This is the simplest valid rigid-body transform and works for synthetic
+    testing (all cameras share the same coordinate frame).
+
+    Returns:
+        cam0_T_camXs: (B, S, 4, 4) float32
+    """
+    return np.tile(np.eye(4, dtype=np.float32)[None, None], (B, S, 1, 1))
+
+
 # ============================= DATA LOADER =================================
 
 def get_synthetic_dataset(cfg: dict, n_samples: int = 64):
-    """Generate synthetic nuScenes-style multi-camera images and BEV labels."""
+    """
+    Generate synthetic nuScenes-style multi-camera data.
+
+    Returns:
+        imgs:         (N, S, 3, H, W)  float32
+        pix_T_cams:   (N, S, 4, 4)    float32  — pinhole intrinsics
+        cam0_T_camXs: (N, S, 4, 4)    float32  — identity extrinsics
+        labels:       (N, bev_h, bev_w) int64
+    """
     inp = cfg["input"]
     mod = cfg["model"]
-    imgs = np.random.randn(n_samples, mod["ncams"], inp["channels"],
-                           inp["height"], inp["width"]).astype(np.float32)
-    labels = np.random.randint(0, mod["num_classes"],
-                               (n_samples, mod["bev_h"], mod["bev_w"])).astype(np.int64)
-    return imgs, labels
+    H, W = inp["height"], inp["width"]
+    S    = mod["ncams"]
+
+    imgs         = np.random.randn(n_samples, S, inp["channels"], H, W).astype(np.float32)
+    pix_T_cams   = make_pinhole_intrinsics(n_samples, S, H, W)
+    cam0_T_camXs = make_identity_extrinsics(n_samples, S)
+    labels       = np.random.randint(0, mod["num_classes"],
+                                     (n_samples, mod["bev_h"], mod["bev_w"])).astype(np.int64)
+    return imgs, pix_T_cams, cam0_T_camXs, labels
 
 
 # ===================== BOUNDING BOX EXTRACTION =============================
@@ -353,16 +407,19 @@ def mse_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
 
 # ===================== PYTORCH INFERENCE ===================================
 
-def pytorch_inference(imgs_np: np.ndarray, cfg: dict):
+def pytorch_inference(imgs_np: np.ndarray, pix_T_cams_np: np.ndarray,
+                      cam0_T_camXs_np: np.ndarray, cfg: dict):
     """
-    Run PyTorch inference.
+    Run PyTorch inference with 3 inputs matching the reference Segnet interface.
 
     Args:
-        imgs_np: (N, 6, 3, H, W) float32 numpy array
+        imgs_np:         (N, S, 3, H, W) float32
+        pix_T_cams_np:   (N, S, 4, 4)   float32  — camera intrinsics
+        cam0_T_camXs_np: (N, S, 4, 4)   float32  — camera extrinsics
         cfg: config dict
 
     Returns:
-        logits: (N, num_classes, bev_h, bev_w) float32 numpy
+        logits: (N, num_classes, bev_h, bev_w) float32
         latency_ms: mean latency per sample
     """
     import torch
@@ -381,44 +438,49 @@ def pytorch_inference(imgs_np: np.ndarray, cfg: dict):
     else:
         print(f"  No checkpoint found at {ckpt_path}, using random weights")
 
-    imgs_t = torch.from_numpy(imgs_np).to(device)
+    imgs_t      = torch.from_numpy(imgs_np).to(device)
+    pix_t       = torch.from_numpy(pix_T_cams_np).to(device)
+    cam0_t      = torch.from_numpy(cam0_T_camXs_np).to(device)
+
     all_logits = []
-    latencies = []
+    latencies  = []
 
     with torch.no_grad():
         # warmup
-        _ = model(imgs_t[:1])
+        _ = model(imgs_t[:1], pix_t[:1], cam0_t[:1])
 
         for i in range(imgs_np.shape[0]):
-            t0 = time.perf_counter()
-            out = model(imgs_t[i : i + 1])          # (1, C, H, W)
+            t0  = time.perf_counter()
+            out = model(imgs_t[i:i+1], pix_t[i:i+1], cam0_t[i:i+1])   # (1, C, H, W)
             latencies.append((time.perf_counter() - t0) * 1000)
             all_logits.append(out.cpu().numpy())
 
-    logits = np.concatenate(all_logits, axis=0)  # (N, C, H, W)
+    logits   = np.concatenate(all_logits, axis=0)  # (N, C, H, W)
     mean_lat = float(np.mean(latencies))
     return logits, mean_lat
 
 
 # ===================== ONNX INFERENCE ======================================
 
-def onnx_inference(imgs_np: np.ndarray, cfg: dict):
+def onnx_inference(imgs_np: np.ndarray, pix_T_cams_np: np.ndarray,
+                   cam0_T_camXs_np: np.ndarray, cfg: dict):
     """
-    Run ONNX Runtime inference.
+    Run ONNX Runtime inference with 3 inputs.
 
     Args:
-        imgs_np: (N, 6, 3, H, W) float32 numpy array
+        imgs_np:         (N, S, 3, H, W) float32
+        pix_T_cams_np:   (N, S, 4, 4)   float32
+        cam0_T_camXs_np: (N, S, 4, 4)   float32
         cfg: config dict
 
     Returns:
-        logits: (N, num_classes, bev_h, bev_w) float32 numpy
+        logits: (N, num_classes, bev_h, bev_w) float32
         latency_ms: mean latency per sample
     """
     import onnxruntime as ort
 
-    provider = cfg["inference"].get("provider", "CPUExecutionProvider")
-    model_path = cfg["inference"].get("model_path",
-                                      "artifacts/simple_bev_optimized.onnx")
+    provider   = cfg["inference"].get("provider", "CPUExecutionProvider")
+    model_path = cfg["inference"].get("model_path", "artifacts/simple_bev_optimized.onnx")
     if not os.path.exists(model_path):
         # fallback to non-optimized
         model_path = model_path.replace("_optimized", "")
@@ -429,24 +491,37 @@ def onnx_inference(imgs_np: np.ndarray, cfg: dict):
 
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session = ort.InferenceSession(model_path, opts, providers=[provider])
-    iname = session.get_inputs()[0].name
-    oname = session.get_outputs()[0].name
+    session  = ort.InferenceSession(model_path, opts, providers=[provider])
+
+    # Map ONNX input names to arrays (order: rgb_camXs, pix_T_cams, cam0_T_camXs)
+    in_names = [inp.name for inp in session.get_inputs()]
+    out_name = session.get_outputs()[0].name
     print(f"  Loaded ONNX model: {model_path}  (provider={provider})")
+    print(f"  ONNX inputs ({len(in_names)}): {in_names}")
 
     all_logits = []
-    latencies = []
+    latencies  = []
 
     # warmup
-    session.run([oname], {iname: imgs_np[:1]})
+    feed0 = {
+        in_names[0]: imgs_np[:1],
+        in_names[1]: pix_T_cams_np[:1],
+        in_names[2]: cam0_T_camXs_np[:1],
+    }
+    session.run([out_name], feed0)
 
     for i in range(imgs_np.shape[0]):
-        t0 = time.perf_counter()
-        out = session.run([oname], {iname: imgs_np[i : i + 1]})
+        feed = {
+            in_names[0]: imgs_np[i:i+1],
+            in_names[1]: pix_T_cams_np[i:i+1],
+            in_names[2]: cam0_T_camXs_np[i:i+1],
+        }
+        t0  = time.perf_counter()
+        out = session.run([out_name], feed)
         latencies.append((time.perf_counter() - t0) * 1000)
         all_logits.append(out[0])
 
-    logits = np.concatenate(all_logits, axis=0)
+    logits   = np.concatenate(all_logits, axis=0)
     mean_lat = float(np.mean(latencies))
     return logits, mean_lat
 
@@ -508,8 +583,8 @@ def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
     lines.append("")
 
     # ----- Latency Comparison -----
-    pt_lat = pytorch_metrics["latency_ms"]
-    ox_lat = onnx_metrics["latency_ms"]
+    pt_lat  = pytorch_metrics["latency_ms"]
+    ox_lat  = onnx_metrics["latency_ms"]
     speedup = pt_lat / ox_lat if ox_lat > 0 else 0
     lines.append("LATENCY COMPARISON")
     lines.append("-" * 40)
@@ -521,7 +596,7 @@ def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
     lines.append(f"  Output images saved to : {output_dir}")
     lines.append("=" * 70)
 
-    report = "\n".join(lines)
+    report      = "\n".join(lines)
     report_path = os.path.join(output_dir, "evaluation_report.txt")
     with open(report_path, "w") as f:
         f.write(report)
@@ -532,7 +607,7 @@ def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simple-BEV Inference with bbox output, IoU metrics & MSC verification")
+        description="Simple-BEV Inference with bbox output, IoU metrics & MSE verification")
     parser.add_argument("--config", default="configs/config.yaml",
                         help="Path to config YAML")
     parser.add_argument("--data", choices=["nuscenes", "synthetic"], default=None,
@@ -551,9 +626,9 @@ def main():
     num_classes = cfg["model"]["num_classes"]
     num_samples = (args.num_samples
                    or cfg.get("evaluation", {}).get("num_synthetic_samples", 64))
-    output_dir = (args.output_dir
-                  or cfg.get("inference", {}).get("output_dir", "output_bev_results/"))
-    min_area = cfg.get("inference", {}).get("min_component_area", 10)
+    output_dir  = (args.output_dir
+                   or cfg.get("inference", {}).get("output_dir", "output_bev_results/"))
+    min_area    = cfg.get("inference", {}).get("min_component_area", 10)
 
     if args.provider:
         cfg["inference"]["provider"] = args.provider
@@ -571,25 +646,30 @@ def main():
     if data_source == "nuscenes":
         print(f"\n[1/5] Loading nuScenes mini dataset ...")
         from src.data.nuscenes_loader import get_nuscenes_dataset
-        imgs, gt_labels = get_nuscenes_dataset(cfg, max_samples=num_samples)
+        imgs, pix_T_cams, cam0_T_camXs, gt_labels = get_nuscenes_dataset(
+            cfg, max_samples=num_samples)
         num_samples = imgs.shape[0]
     else:
         print(f"\n[1/5] Generating {num_samples} synthetic samples ...")
-        imgs, gt_labels = get_synthetic_dataset(cfg, n_samples=num_samples)
-    print(f"  Data source  : {data_source}")
-    print(f"  Input shape  : {imgs.shape}  (N, cams, C, H, W)")
-    print(f"  Labels shape : {gt_labels.shape}  (N, bev_H, bev_W)")
+        imgs, pix_T_cams, cam0_T_camXs, gt_labels = get_synthetic_dataset(
+            cfg, n_samples=num_samples)
+
+    print(f"  Data source      : {data_source}")
+    print(f"  imgs shape       : {imgs.shape}  (N, S, C, H, W)")
+    print(f"  pix_T_cams shape : {pix_T_cams.shape}")
+    print(f"  cam0_T_camXs     : {cam0_T_camXs.shape}")
+    print(f"  Labels shape     : {gt_labels.shape}  (N, bev_H, bev_W)")
 
     # ---- 2. PyTorch inference ----
     print("\n[2/5] Running PyTorch inference ...")
-    pt_logits, pt_latency = pytorch_inference(imgs, cfg)
+    pt_logits, pt_latency = pytorch_inference(imgs, pix_T_cams, cam0_T_camXs, cfg)
     pt_preds = pt_logits.argmax(axis=1)  # (N, H, W)
     print(f"  Output shape : {pt_logits.shape}")
     print(f"  Mean latency : {pt_latency:.2f} ms/sample")
 
     # ---- 3. ONNX inference ----
     print("\n[3/5] Running ONNX Runtime inference ...")
-    ox_logits, ox_latency = onnx_inference(imgs, cfg)
+    ox_logits, ox_latency = onnx_inference(imgs, pix_T_cams, cam0_T_camXs, cfg)
     ox_preds = ox_logits.argmax(axis=1)  # (N, H, W)
     print(f"  Output shape : {ox_logits.shape}")
     print(f"  Mean latency : {ox_latency:.2f} ms/sample")

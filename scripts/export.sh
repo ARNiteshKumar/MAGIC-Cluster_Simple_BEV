@@ -34,23 +34,44 @@ else:
 model.eval()
 
 # ──────────────────────────────────────────────────────────────────────
-# 2. Export to ONNX
+# 2. Export to ONNX  — 3 inputs matching reference Segnet interface
+#    rgb_camXs:    (B, 6, 3, H, W)
+#    pix_T_cams:   (B, 6, 4, 4)
+#    cam0_T_camXs: (B, 6, 4, 4)
 # ──────────────────────────────────────────────────────────────────────
-print("\n[2/6] Exporting to ONNX (opset 17) ...")
-dummy = torch.randn(1, 6, 3, 224, 400)
-onnx_path = 'artifacts/simple_bev.onnx'
+print("\n[2/6] Exporting to ONNX (opset 17, 3 inputs) ...")
+B, S, H, W = 1, 6, 224, 400
+
+# Dummy rgb images
+dummy_imgs = torch.randn(B, S, 3, H, W)
+
+# Dummy intrinsics: pinhole camera with fx=fy=W, cx=W/2, cy=H/2
+dummy_pix_T_cams = torch.zeros(B, S, 4, 4)
+dummy_pix_T_cams[:, :, 0, 0] = float(W)    # fx
+dummy_pix_T_cams[:, :, 1, 1] = float(W)    # fy
+dummy_pix_T_cams[:, :, 0, 2] = W / 2.0     # cx
+dummy_pix_T_cams[:, :, 1, 2] = H / 2.0     # cy
+dummy_pix_T_cams[:, :, 2, 2] = 1.0
+dummy_pix_T_cams[:, :, 3, 3] = 1.0
+
+# Dummy extrinsics: identity for all cameras (cam0 = camX = ego frame)
+dummy_cam0_T_camXs = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
+onnx_path     = 'artifacts/simple_bev.onnx'
 onnx_opt_path = 'artifacts/simple_bev_optimized.onnx'
 
 with torch.no_grad():
     torch.onnx.export(
         model,
-        dummy,
+        (dummy_imgs, dummy_pix_T_cams, dummy_cam0_T_camXs),
         onnx_path,
         opset_version=17,
-        input_names=['multi_camera_imgs'],
+        input_names=['rgb_camXs', 'pix_T_cams', 'cam0_T_camXs'],
         output_names=['bev_segmentation'],
         dynamic_axes={
-            'multi_camera_imgs': {0: 'batch'},
+            'rgb_camXs':    {0: 'batch'},
+            'pix_T_cams':   {0: 'batch'},
+            'cam0_T_camXs': {0: 'batch'},
             'bev_segmentation': {0: 'batch'},
         },
     )
@@ -63,6 +84,10 @@ print("\n[3/6] Validating ONNX graph ...")
 onnx_model = onnx.load(onnx_path)
 onnx.checker.check_model(onnx_model)
 print("  ONNX graph validation: PASSED")
+print(f"  Inputs  ({len(onnx_model.graph.input)}): " +
+      ", ".join(i.name for i in onnx_model.graph.input))
+print(f"  Outputs ({len(onnx_model.graph.output)}): " +
+      ", ".join(o.name for o in onnx_model.graph.output))
 
 # ──────────────────────────────────────────────────────────────────────
 # 4. Simplify / Optimize ONNX
@@ -78,18 +103,18 @@ else:
     final_onnx_path = onnx_path
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. Load ONNX in ONNX Runtime and run inference
+# 5. Load ONNX in ONNX Runtime and inspect
 # ──────────────────────────────────────────────────────────────────────
 print("\n[5/6] Loading ONNX model in ONNX Runtime ...")
 sess_opts = ort.SessionOptions()
 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 session = ort.InferenceSession(final_onnx_path, sess_opts,
                                providers=['CPUExecutionProvider'])
-input_name = session.get_inputs()[0].name
-output_name = session.get_outputs()[0].name
 print(f"  ONNX Runtime session created")
-print(f"  Input  : {input_name}  shape={session.get_inputs()[0].shape}")
-print(f"  Output : {output_name} shape={session.get_outputs()[0].shape}")
+for inp in session.get_inputs():
+    print(f"  Input  : {inp.name}  shape={inp.shape}  dtype={inp.type}")
+for out in session.get_outputs():
+    print(f"  Output : {out.name} shape={out.shape}  dtype={out.type}")
 print(f"  Provider: {session.get_providers()}")
 
 # ──────────────────────────────────────────────────────────────────────
@@ -98,54 +123,58 @@ print(f"  Provider: {session.get_providers()}")
 print("\n[6/6] Numerical validation: PyTorch vs ONNX Runtime ...")
 print(f"  MSE threshold: {MSE_THRESHOLD:.0e}")
 
-# Use multiple random inputs for robust validation
+in_names = [i.name for i in session.get_inputs()]
+out_name = session.get_outputs()[0].name
+
 num_test_inputs = 5
 all_mse = []
 all_max_diff = []
 
 for i in range(num_test_inputs):
-    test_input = torch.randn(1, 6, 3, 224, 400)
-    test_np = test_input.numpy()
+    imgs_t      = torch.randn(1, S, 3, H, W)
+    pix_t       = dummy_pix_T_cams.clone()
+    cam0_t      = dummy_cam0_T_camXs.clone()
 
     # PyTorch forward pass
     with torch.no_grad():
-        pt_output = model(test_input).numpy()
+        pt_output = model(imgs_t, pix_t, cam0_t).numpy()
 
     # ONNX Runtime forward pass
-    ort_output = session.run([output_name], {input_name: test_np})[0]
+    feed = {
+        in_names[0]: imgs_t.numpy(),
+        in_names[1]: pix_t.numpy(),
+        in_names[2]: cam0_t.numpy(),
+    }
+    ort_output = session.run([out_name], feed)[0]
 
-    # Compute metrics
-    diff = pt_output.astype(np.float64) - ort_output.astype(np.float64)
-    mse = float(np.mean(diff ** 2))
+    diff     = pt_output.astype(np.float64) - ort_output.astype(np.float64)
+    mse      = float(np.mean(diff ** 2))
     max_diff = float(np.max(np.abs(diff)))
-    mean_abs_diff = float(np.mean(np.abs(diff)))
+    mean_abs = float(np.mean(np.abs(diff)))
 
     all_mse.append(mse)
     all_max_diff.append(max_diff)
-
     print(f"  Sample {i+1}/{num_test_inputs}: "
-          f"MSE={mse:.2e}  MaxDiff={max_diff:.2e}  MeanAbsDiff={mean_abs_diff:.2e}")
+          f"MSE={mse:.2e}  MaxDiff={max_diff:.2e}  MeanAbsDiff={mean_abs:.2e}")
 
-avg_mse = np.mean(all_mse)
+avg_mse   = np.mean(all_mse)
 worst_mse = np.max(all_mse)
-worst_max_diff = np.max(all_max_diff)
+worst_max = np.max(all_max_diff)
 
-# Cosine similarity on the last sample
 a = pt_output.flatten().astype(np.float64)
 b = ort_output.flatten().astype(np.float64)
 cosine_sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
-# Prediction agreement (argmax match %)
-pt_pred = pt_output.argmax(axis=1)
-ox_pred = ort_output.argmax(axis=1)
-pred_agreement = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
+pt_pred    = pt_output.argmax(axis=1)
+ox_pred    = ort_output.argmax(axis=1)
+pred_agree = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
 
 print(f"\n  ====== VALIDATION SUMMARY ======")
 print(f"  Average MSE          : {avg_mse:.2e}")
 print(f"  Worst-case MSE       : {worst_mse:.2e}")
-print(f"  Worst-case MaxDiff   : {worst_max_diff:.2e}")
+print(f"  Worst-case MaxDiff   : {worst_max:.2e}")
 print(f"  Cosine Similarity    : {cosine_sim:.10f}")
-print(f"  Prediction Agreement : {pred_agreement:.2f}%")
+print(f"  Prediction Agreement : {pred_agree:.2f}%")
 print(f"  MSE Threshold        : {MSE_THRESHOLD:.0e}")
 
 if worst_mse < MSE_THRESHOLD:
