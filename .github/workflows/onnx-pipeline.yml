@@ -50,23 +50,36 @@ jobs:
           with open('configs/config.yaml') as f:
               cfg = yaml.safe_load(f)
 
-          # Override for CI: fewer epochs, CPU only
           cfg['training']['epochs'] = 3
           cfg['training']['device'] = 'cpu'
 
-          model = build_model(cfg)
+          H   = cfg['input']['height']    # 224
+          W   = cfg['input']['width']     # 400
+          S   = cfg['model']['ncams']     # 6
+          N   = 8
+
+          model     = build_model(cfg)
           optimizer = optim.AdamW(model.parameters(), lr=cfg['training']['learning_rate'])
           criterion = nn.CrossEntropyLoss()
-          inp = cfg['input']; mod = cfg['model']
-          imgs = torch.randn(8, mod['ncams'], inp['channels'], inp['height'], inp['width'])
-          labels = torch.randint(0, mod['num_classes'], (8, mod['bev_h'], mod['bev_w']))
-          loader = DataLoader(TensorDataset(imgs, labels), batch_size=2, shuffle=True)
+
+          # Synthetic camera intrinsics: pinhole with fx=fy=W, cx=W/2, cy=H/2
+          K = torch.zeros(4, 4)
+          K[0,0]=float(W); K[1,1]=float(W); K[0,2]=W/2.0; K[1,2]=H/2.0
+          K[2,2]=1.0; K[3,3]=1.0
+          pix_T_cams   = K.unsqueeze(0).unsqueeze(0).expand(N, S, -1, -1).clone()
+          cam0_T_camXs = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(N, S, -1, -1).clone()
+
+          imgs   = torch.randn(N, S, cfg['input']['channels'], H, W)
+          labels = torch.randint(0, cfg['model']['num_classes'],
+                                 (N, cfg['model']['bev_h'], cfg['model']['bev_w']))
+          loader = DataLoader(TensorDataset(imgs, pix_T_cams, cam0_T_camXs, labels),
+                              batch_size=2, shuffle=True)
 
           for epoch in range(1, cfg['training']['epochs'] + 1):
               model.train(); total_loss = 0.0
-              for batch_imgs, batch_labels in loader:
+              for batch_imgs, batch_pix, batch_cam0, batch_labels in loader:
                   optimizer.zero_grad()
-                  loss = criterion(model(batch_imgs), batch_labels)
+                  loss = criterion(model(batch_imgs, batch_pix, batch_cam0), batch_labels)
                   loss.backward(); optimizer.step()
                   total_loss += loss.item()
               print(f'Epoch [{epoch}/{cfg[\"training\"][\"epochs\"]}] Loss: {total_loss/len(loader):.4f}')
@@ -76,36 +89,53 @@ jobs:
           print('Model saved to artifacts/simple_bev.pt')
           "
 
-      - name: Export to ONNX
+      - name: Export to ONNX (3 inputs)
         run: |
           python -c "
           import torch, onnx, sys
           sys.path.insert(0, '.')
           from src.models.simple_bev import SimpleBEVModel
 
+          B, S, H, W = 1, 6, 224, 400
+
           model = SimpleBEVModel()
           state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
           model.load_state_dict(state)
           model.eval()
 
-          dummy = torch.randn(1, 6, 3, 224, 400)
+          # Three dummy inputs matching the reference Segnet interface
+          dummy_imgs = torch.randn(B, S, 3, H, W)
+
+          K = torch.zeros(4, 4)
+          K[0,0]=float(W); K[1,1]=float(W); K[0,2]=W/2.0; K[1,2]=H/2.0
+          K[2,2]=1.0; K[3,3]=1.0
+          dummy_pix  = K.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+          dummy_cam0 = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
           with torch.no_grad():
               torch.onnx.export(
-                  model, dummy, 'artifacts/simple_bev.onnx',
+                  model,
+                  (dummy_imgs, dummy_pix, dummy_cam0),
+                  'artifacts/simple_bev.onnx',
                   opset_version=17,
-                  input_names=['multi_camera_imgs'],
+                  input_names=['rgb_camXs', 'pix_T_cams', 'cam0_T_camXs'],
                   output_names=['bev_segmentation'],
                   dynamic_axes={
-                      'multi_camera_imgs': {0: 'batch'},
+                      'rgb_camXs':        {0: 'batch'},
+                      'pix_T_cams':       {0: 'batch'},
+                      'cam0_T_camXs':     {0: 'batch'},
                       'bev_segmentation': {0: 'batch'},
                   },
               )
           print('ONNX exported: artifacts/simple_bev.onnx')
 
-          # Validate graph
           onnx_model = onnx.load('artifacts/simple_bev.onnx')
           onnx.checker.check_model(onnx_model)
-          print('ONNX graph validation: PASSED')
+          n_inputs  = len(onnx_model.graph.input)
+          in_names  = [i.name for i in onnx_model.graph.input]
+          print(f'ONNX graph validation: PASSED')
+          print(f'ONNX inputs ({n_inputs}): {in_names}')
+          assert n_inputs == 3, f'Expected 3 ONNX inputs, got {n_inputs}'
           "
 
       - name: Simplify ONNX model
@@ -133,43 +163,54 @@ jobs:
           from src.models.simple_bev import SimpleBEVModel
 
           MSE_THRESHOLD = 1e-6
+          B, S, H, W = 1, 6, 224, 400
 
-          # Load PyTorch model
+          # ── PyTorch model ────────────────────────────────────────────
           model = SimpleBEVModel()
           state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
           model.load_state_dict(state)
           model.eval()
 
-          # Load ONNX model
+          # ── ONNX Runtime session ─────────────────────────────────────
           opts = ort.SessionOptions()
           opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
           sess = ort.InferenceSession('artifacts/simple_bev_optimized.onnx', opts,
-                                      providers=['CPUExecutionProvider'])
-          iname = sess.get_inputs()[0].name
-          oname = sess.get_outputs()[0].name
-
-          print(f'Input:  {iname} shape={sess.get_inputs()[0].shape}')
+                                     providers=['CPUExecutionProvider'])
+          in_names = [i.name for i in sess.get_inputs()]
+          oname    = sess.get_outputs()[0].name
+          print(f'ONNX inputs ({len(in_names)}): {in_names}')
+          for i in sess.get_inputs():
+              print(f'  {i.name}: shape={i.shape}')
           print(f'Output: {oname} shape={sess.get_outputs()[0].shape}')
 
-          # Test with multiple random inputs
+          # Shared dummy camera matrices (same for all test runs)
+          K = torch.zeros(4, 4)
+          K[0,0]=float(W); K[1,1]=float(W); K[0,2]=W/2.0; K[1,2]=H/2.0
+          K[2,2]=1.0; K[3,3]=1.0
+          dummy_pix  = K.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+          dummy_cam0 = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
+          # ── Numerical tests ──────────────────────────────────────────
           worst_mse = 0.0
           for i in range(5):
-              test_input = torch.randn(1, 6, 3, 224, 400)
+              imgs_t = torch.randn(B, S, 3, H, W)
               with torch.no_grad():
-                  pt_out = model(test_input).numpy()
-              ort_out = sess.run([oname], {iname: test_input.numpy()})[0]
-
-              diff = pt_out.astype(np.float64) - ort_out.astype(np.float64)
-              mse = float(np.mean(diff ** 2))
+                  pt_out = model(imgs_t, dummy_pix, dummy_cam0).numpy()
+              feed = {
+                  in_names[0]: imgs_t.numpy(),
+                  in_names[1]: dummy_pix.numpy(),
+                  in_names[2]: dummy_cam0.numpy(),
+              }
+              ort_out  = sess.run([oname], feed)[0]
+              diff     = pt_out.astype(np.float64) - ort_out.astype(np.float64)
+              mse      = float(np.mean(diff ** 2))
               max_diff = float(np.max(np.abs(diff)))
               worst_mse = max(worst_mse, mse)
               print(f'  Sample {i+1}/5: MSE={mse:.2e}  MaxDiff={max_diff:.2e}')
 
-          # Prediction agreement
-          pt_pred = pt_out.argmax(axis=1)
-          ox_pred = ort_out.argmax(axis=1)
+          pt_pred   = pt_out.argmax(axis=1)
+          ox_pred   = ort_out.argmax(axis=1)
           agreement = float((pt_pred == ox_pred).sum()) / float(pt_pred.size) * 100.0
-
           print(f'')
           print(f'Worst MSE:            {worst_mse:.2e}')
           print(f'Prediction agreement: {agreement:.2f}%')
@@ -189,38 +230,51 @@ jobs:
           sys.path.insert(0, '.')
           from src.models.simple_bev import SimpleBEVModel
 
+          B, S, H, W = 1, 6, 224, 400
+
           model = SimpleBEVModel()
           state = torch.load('artifacts/simple_bev.pt', map_location='cpu', weights_only=True)
           model.load_state_dict(state)
           model.eval()
-          dummy = torch.randn(1, 6, 3, 224, 400)
 
-          # PyTorch benchmark
+          # Three inputs for the benchmark
+          bench_imgs = torch.randn(B, S, 3, H, W)
+          K = torch.zeros(4, 4)
+          K[0,0]=float(W); K[1,1]=float(W); K[0,2]=W/2.0; K[1,2]=H/2.0
+          K[2,2]=1.0; K[3,3]=1.0
+          bench_pix  = K.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+          bench_cam0 = torch.eye(4).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1).contiguous()
+
+          # PyTorch warmup + benchmark
           with torch.no_grad():
-              for _ in range(3): model(dummy)
+              for _ in range(3): model(bench_imgs, bench_pix, bench_cam0)
           pt_lats = []
           with torch.no_grad():
               for _ in range(10):
                   t0 = time.perf_counter()
-                  model(dummy)
+                  model(bench_imgs, bench_pix, bench_cam0)
                   pt_lats.append((time.perf_counter() - t0) * 1000)
 
-          # ONNX benchmark
+          # ONNX Runtime warmup + benchmark
           opts = ort.SessionOptions()
           opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
           sess = ort.InferenceSession('artifacts/simple_bev_optimized.onnx', opts,
-                                      providers=['CPUExecutionProvider'])
-          iname = sess.get_inputs()[0].name
-          oname = sess.get_outputs()[0].name
-          dummy_np = dummy.numpy()
-          for _ in range(3): sess.run([oname], {iname: dummy_np})
+                                     providers=['CPUExecutionProvider'])
+          in_names  = [i.name for i in sess.get_inputs()]
+          oname     = sess.get_outputs()[0].name
+          bench_feed = {
+              in_names[0]: bench_imgs.numpy(),
+              in_names[1]: bench_pix.numpy(),
+              in_names[2]: bench_cam0.numpy(),
+          }
+          for _ in range(3): sess.run([oname], bench_feed)
           ort_lats = []
           for _ in range(10):
               t0 = time.perf_counter()
-              sess.run([oname], {iname: dummy_np})
+              sess.run([oname], bench_feed)
               ort_lats.append((time.perf_counter() - t0) * 1000)
 
-          pt_arr = np.array(pt_lats)
+          pt_arr  = np.array(pt_lats)
           ort_arr = np.array(ort_lats)
           print(f'PyTorch CPU:  {pt_arr.mean():.1f} ms (p95: {np.percentile(pt_arr, 95):.1f} ms)')
           print(f'ONNX Runtime: {ort_arr.mean():.1f} ms (p95: {np.percentile(ort_arr, 95):.1f} ms)')
