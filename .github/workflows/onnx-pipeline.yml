@@ -287,6 +287,8 @@ jobs:
         with:
           name: onnx-pipeline-artifacts
           path: |
+            artifacts/simple_bev.pt
             artifacts/simple_bev.onnx
+            artifacts/simple_bev.onnx.data
             artifacts/simple_bev_optimized.onnx
           retention-days: 7
